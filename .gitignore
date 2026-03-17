@@ -1,0 +1,34 @@
+/target
+/CLAUDE.md
+/AGENTS.md
+/config.json
+/credentials.json
+/.idea
+/test.json
+/Cargo.lock
+/admin-ui/node_modules/
+/admin-ui/dist/
+/admin-ui/pnpm-lock.yaml
+/admin-ui/package-lock.json
+/admin-ui/tsconfig.tsbuildinfo
+/credentials.*
+/kiro_balance_cache.json
+/kiro_stats.json
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# Backups
+backups/
+
+# Temp JSON files
+2-*.json
+3-*.json
+fk.json
+kiro-*.json
+config.*.json
+kiro_kv_cache_*.json*
+kiro_prompt_failure_*.jsonl

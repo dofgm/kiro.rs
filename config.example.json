@@ -1,0 +1,9 @@
+{
+  "host": "0.0.0.0",
+  "port": 8990,
+  "apiKey": "sk-kiro-rs-e87684b2faf6a2e199ef1c36d6dc3d31",
+  "tlsBackend": "rustls",
+  "region": "us-east-1",
+  "stripBillingHeader": true,
+  "adminApiKey": "sk-admin-a219f5ec277184fe23df964a05c33c8f"
+}
