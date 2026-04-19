@@ -178,6 +178,60 @@ pub struct BalanceResponse {
     pub next_reset_at: Option<f64>,
 }
 
+// ============ 请求明细 ============
+
+/// 请求明细查询参数
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestDetailsQuery {
+    /// 返回条数（默认 100，最大 1000）
+    pub limit: Option<usize>,
+}
+
+/// 请求明细响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestDetailsResponse {
+    /// 解析成功的总记录数
+    pub total: usize,
+    /// 明细列表（按时间倒序）
+    pub records: Vec<RequestDetailItem>,
+}
+
+/// 单次请求明细
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestDetailItem {
+    /// 记录时间（RFC3339）
+    pub recorded_at: String,
+    /// 请求 ID
+    pub request_id: String,
+    /// 接口路径
+    pub endpoint: String,
+    /// 模型名
+    pub model: String,
+    /// 凭据 ID（可能为 0，新版已移除该字段）
+    pub credential_id: u64,
+    /// 是否流式
+    pub stream: bool,
+    /// 是否命中缓存
+    pub cache_hit: bool,
+    /// 输入 tokens（不包含缓存读取和缓存创建）
+    pub input_tokens: i32,
+    /// 缓存读取 tokens
+    pub cached_tokens: i32,
+    /// 输出 tokens
+    pub output_tokens: i32,
+    /// 缓存命中比例（cached / total_input）
+    pub cache_ratio: f64,
+    /// 按模型价格估算的费用（USD）
+    pub cost_usd: f64,
+    /// 上游返回的 credits（用于对照）
+    pub credits_used: f64,
+    /// 特殊设置命中记录（用于审计）
+    pub special_settings: Vec<String>,
+}
+
 // ============ 负载均衡配置 ============
 
 /// 负载均衡模式响应

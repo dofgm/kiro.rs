@@ -1,6 +1,8 @@
 //! Admin API 业务逻辑服务
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,11 +16,47 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    CredentialsStatusResponse, LoadBalancingModeResponse, RequestDetailItem,
+    RequestDetailsResponse, SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+/// 请求明细默认返回条数
+const REQUEST_DETAILS_DEFAULT_LIMIT: usize = 100;
+/// 请求明细最大返回条数
+const REQUEST_DETAILS_MAX_LIMIT: usize = 1000;
+/// 模拟 KV 缓存记录文件名
+const KV_CACHE_RECORDS_FILE: &str = "kiro_kv_cache_records.jsonl";
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KvCacheRecordRow {
+    recorded_at: String,
+    request_id: String,
+    endpoint: String,
+    model: String,
+    #[serde(default)]
+    credential_id: u64,
+    stream: bool,
+    cache_hit: bool,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
+    input_tokens: i32,
+    output_tokens: i32,
+    #[serde(default)]
+    credits_used: f64,
+    #[serde(default)]
+    special_settings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModelPricing {
+    input_per_million: f64,
+    output_per_million: f64,
+    cache_write_per_million: f64,
+    cache_read_per_million: f64,
+}
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +76,7 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    request_details_path: PathBuf,
 }
 
 impl AdminService {
@@ -45,9 +84,13 @@ impl AdminService {
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
     ) -> Self {
+        let cache_dir = token_manager
+            .cache_dir()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let cache_path = token_manager
             .cache_dir()
             .map(|d| d.join("kiro_balance_cache.json"));
+        let request_details_path = cache_dir.join(KV_CACHE_RECORDS_FILE);
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
 
@@ -56,6 +99,7 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            request_details_path,
         }
     }
 
@@ -305,6 +349,184 @@ impl AdminService {
             .force_refresh_token_for(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))
+    }
+
+    /// 获取请求明细（来自模拟 KV 缓存 JSONL）
+    pub fn get_request_details(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<RequestDetailsResponse, AdminServiceError> {
+        let limit = limit
+            .unwrap_or(REQUEST_DETAILS_DEFAULT_LIMIT)
+            .clamp(1, REQUEST_DETAILS_MAX_LIMIT);
+
+        let file = match File::open(&self.request_details_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RequestDetailsResponse {
+                    total: 0,
+                    records: Vec::new(),
+                });
+            }
+            Err(e) => {
+                return Err(AdminServiceError::InternalError(format!(
+                    "读取请求明细文件失败: {}",
+                    e
+                )));
+            }
+        };
+
+        let reader = BufReader::new(file);
+        let mut rows = Vec::new();
+
+        for (line_no, line) in reader.lines().enumerate() {
+            let line = match line {
+                Ok(line) => line,
+                Err(e) => {
+                    tracing::warn!("读取请求明细第 {} 行失败: {}", line_no + 1, e);
+                    continue;
+                }
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let stream =
+                serde_json::Deserializer::from_str(line).into_iter::<KvCacheRecordRow>();
+            let mut parsed = false;
+            let mut had_error = false;
+            for item in stream {
+                match item {
+                    Ok(row) => {
+                        rows.push(row);
+                        parsed = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!("解析请求明细第 {} 行失败: {}", line_no + 1, e);
+                        had_error = true;
+                        break;
+                    }
+                }
+            }
+            if !parsed && !had_error {
+                tracing::warn!("解析请求明细第 {} 行失败: 空或无效 JSON", line_no + 1);
+            }
+        }
+
+        let total = rows.len();
+        let records = rows
+            .into_iter()
+            .rev()
+            .take(limit)
+            .map(Self::map_request_detail)
+            .collect();
+
+        Ok(RequestDetailsResponse { total, records })
+    }
+
+    /// 清空请求明细（截断 JSONL 文件）
+    pub fn clear_request_details(&self) -> Result<(), AdminServiceError> {
+        match File::create(&self.request_details_path) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(AdminServiceError::InternalError(format!(
+                "清空请求明细文件失败: {}",
+                e
+            ))),
+        }
+    }
+
+    // ============ 请求明细映射与费用计算 ============
+    fn map_request_detail(row: KvCacheRecordRow) -> RequestDetailItem {
+        let total_input_tokens = row.input_tokens.max(0);
+        let cache_creation_tokens = row.cache_creation_input_tokens.max(0);
+        let cached_tokens = row.cache_read_input_tokens.max(0);
+        let input_tokens = total_input_tokens
+            .saturating_sub(cache_creation_tokens.saturating_add(cached_tokens))
+            .max(0);
+        let output_tokens = row.output_tokens.max(0);
+        let cache_ratio = if total_input_tokens > 0 {
+            (cached_tokens as f64 / total_input_tokens as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let cost_usd = Self::calculate_request_cost(
+            &row.model,
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cached_tokens,
+        );
+
+        RequestDetailItem {
+            recorded_at: row.recorded_at,
+            request_id: row.request_id,
+            endpoint: row.endpoint,
+            model: row.model,
+            credential_id: row.credential_id,
+            stream: row.stream,
+            cache_hit: row.cache_hit,
+            input_tokens,
+            cached_tokens,
+            output_tokens,
+            cache_ratio,
+            cost_usd,
+            credits_used: if row.credits_used.is_finite() {
+                row.credits_used.max(0.0)
+            } else {
+                0.0
+            },
+            special_settings: row.special_settings,
+        }
+    }
+
+    fn calculate_request_cost(
+        model: &str,
+        input_tokens: i32,
+        output_tokens: i32,
+        cache_creation_tokens: i32,
+        cache_read_tokens: i32,
+    ) -> f64 {
+        let pricing = Self::model_pricing(model);
+        let input = input_tokens.max(0) as f64;
+        let output = output_tokens.max(0) as f64;
+        let cache_creation = cache_creation_tokens.max(0) as f64;
+        let cache_read = cache_read_tokens.max(0) as f64;
+        let usd = (input * pricing.input_per_million
+            + cache_creation * pricing.cache_write_per_million
+            + cache_read * pricing.cache_read_per_million
+            + output * pricing.output_per_million)
+            / 1_000_000.0;
+
+        if usd.is_finite() { usd.max(0.0) } else { 0.0 }
+    }
+
+    fn model_pricing(model: &str) -> ModelPricing {
+        let model = model.to_lowercase();
+        if model.contains("opus") {
+            ModelPricing {
+                input_per_million: 15.0,
+                output_per_million: 75.0,
+                cache_write_per_million: 18.75,
+                cache_read_per_million: 1.5,
+            }
+        } else if model.contains("haiku") {
+            ModelPricing {
+                input_per_million: 0.8,
+                output_per_million: 4.0,
+                cache_write_per_million: 1.0,
+                cache_read_per_million: 0.08,
+            }
+        } else {
+            // Sonnet（默认）
+            ModelPricing {
+                input_per_million: 3.0,
+                output_per_million: 15.0,
+                cache_write_per_million: 3.75,
+                cache_read_per_million: 0.3,
+            }
+        }
     }
 
     // ============ 余额缓存持久化 ============

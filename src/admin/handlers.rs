@@ -2,15 +2,15 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
 
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, RequestDetailsQuery, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 
@@ -118,6 +118,27 @@ pub async fn force_refresh_token(
             id
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/details
+/// 获取请求明细（模拟 KV 缓存统计）
+pub async fn get_request_details(
+    State(state): State<AdminState>,
+    Query(query): Query<RequestDetailsQuery>,
+) -> impl IntoResponse {
+    match state.service.get_request_details(query.limit) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/details
+/// 清空请求明细
+pub async fn clear_request_details(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.clear_request_details() {
+        Ok(_) => Json(SuccessResponse::new("请求明细已清空".to_string())).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
