@@ -8,10 +8,6 @@
 /admin-ui/node_modules/
 /admin-ui/dist/
 /admin-ui/tsconfig.tsbuildinfo
-/admin-ui/src.bak.*
-/credentials.json
+/credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
-/kiro_kv_cache_records.jsonl
-/kiro_prompt_failure_records.jsonl
-.DS_Store

@@ -54,6 +54,15 @@ fn sha256_hex(input: &str) -> String {
     format!("{:x}", result)
 }
 
+/// 生成 API Key 脱敏展示(前 4 + ... + 后 4,长度不足或非 ASCII 回退 ***)
+fn mask_api_key(key: &str) -> String {
+    if key.is_ascii() && key.len() > 16 {
+        format!("{}...{}", &key[..4], &key[key.len() - 4..])
+    } else {
+        "***".to_string()
+    }
+}
+
 /// 验证 refreshToken 的基本有效性
 pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::Result<()> {
     let refresh_token = credentials
@@ -100,9 +109,11 @@ pub(crate) async fn refresh_token(
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<KiroCredentials> {
-    // API Key 凭据不需要刷新，直接返回
+    // API Key 凭据不支持 Token 刷新：底层契约级拦截
+    // 其他调用点（try_ensure_token / 活跃路径 / add_credential）在调用前已显式分流 API Key；
+    // 仅 force_refresh_token_for 未分流，此处 bail 让错误自然传播为 400 BAD_REQUEST。
     if credentials.is_api_key_credential() {
-        return Ok(credentials.clone());
+        bail!("API Key 凭据不支持刷新 Token");
     }
 
     validate_refresh_token(credentials)?;
@@ -141,8 +152,7 @@ async fn refresh_social_token(
 
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
     let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
-    let machine_id = machine_id::generate_from_credentials(credentials, config)
-        .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = &config.kiro_version;
 
     let client = build_client(proxy, 60, config.tls_backend)?;
@@ -321,8 +331,7 @@ pub(crate) async fn get_usage_limits(
     // 优先级：凭据.api_region > config.api_region > config.region
     let region = credentials.effective_api_region(config);
     let host = format!("q.{}.amazonaws.com", region);
-    let machine_id = machine_id::generate_from_credentials(credentials, config)
-        .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = &config.kiro_version;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
@@ -453,8 +462,12 @@ pub struct CredentialEntrySnapshot {
     pub has_profile_arn: bool,
     /// Token 过期时间
     pub expires_at: Option<String>,
-    /// refreshToken 的 SHA-256 哈希（用于前端重复检测）
+    /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
     pub refresh_token_hash: Option<String>,
+    /// kiroApiKey 的 SHA-256 哈希（仅 API Key 凭据，用于前端去重）
+    pub api_key_hash: Option<String>,
+    /// kiroApiKey 的脱敏展示（仅 API Key 凭据，用于前端显示）
+    pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
     /// API 调用成功次数
@@ -471,6 +484,9 @@ pub struct CredentialEntrySnapshot {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -566,12 +582,9 @@ impl MultiTokenManager {
                     id
                 });
                 if cred.machine_id.is_none() {
-                    if let Some(machine_id) =
-                        machine_id::generate_from_credentials(&cred, config_ref)
-                    {
-                        cred.machine_id = Some(machine_id);
-                        has_new_machine_ids = true;
-                    }
+                    cred.machine_id =
+                        Some(machine_id::generate_from_credentials(&cred, config_ref));
+                    has_new_machine_ids = true;
                 }
                 CredentialEntry {
                     id,
@@ -1407,21 +1420,24 @@ impl MultiTokenManager {
                     },
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: if e.credentials.is_api_key_credential() {
-                        None // API Key 不过期
+                        None // API Key 凭据本地不维护过期时间（服务端策略未知）
                     } else {
                         e.credentials.expires_at.clone()
                     },
                     refresh_token_hash: if e.credentials.is_api_key_credential() {
-                        // API Key 凭据显示脱敏的 key
-                        e.credentials.kiro_api_key.as_deref().map(|k| {
-                            if k.is_ascii() && k.len() > 16 {
-                                format!("{}...{}", &k[..4], &k[k.len()-4..])
-                            } else {
-                                "***".to_string()
-                            }
-                        })
+                        None
                     } else {
                         e.credentials.refresh_token.as_deref().map(sha256_hex)
+                    },
+                    api_key_hash: if e.credentials.is_api_key_credential() {
+                        e.credentials.kiro_api_key.as_deref().map(sha256_hex)
+                    } else {
+                        None
+                    },
+                    masked_api_key: if e.credentials.is_api_key_credential() {
+                        e.credentials.kiro_api_key.as_deref().map(mask_api_key)
+                    } else {
+                        None
                     },
                     email: e.credentials.email.clone(),
                     success_count: e.success_count,
@@ -1437,6 +1453,7 @@ impl MultiTokenManager {
                         DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                         DisabledReason::InvalidConfig => "InvalidConfig",
                     }.to_string()),
+                    endpoint: e.credentials.endpoint.clone(),
                 })
                 .collect(),
             current_id,
@@ -1984,6 +2001,24 @@ mod tests {
         assert_eq!(
             result,
             "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_token_rejects_api_key_credential() {
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.kiro_api_key = Some("ksk_test_key_123".to_string());
+        credentials.auth_method = Some("api_key".to_string());
+
+        let result = refresh_token(&credentials, &config, None).await;
+
+        assert!(result.is_err(), "API Key 凭据应被 refresh_token 拒绝");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("API Key 凭据不支持刷新"),
+            "期望错误消息包含 'API Key 凭据不支持刷新'，实际: {}",
+            err_msg
         );
     }
 

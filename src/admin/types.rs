@@ -38,8 +38,12 @@ pub struct CredentialStatusItem {
     pub auth_method: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
-    /// refreshToken 的 SHA-256 哈希（用于前端重复检测）
+    /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
     pub refresh_token_hash: Option<String>,
+    /// kiroApiKey 的 SHA-256 哈希（仅 API Key 凭据，用于前端去重）
+    pub api_key_hash: Option<String>,
+    /// kiroApiKey 的脱敏展示（仅 API Key 凭据，用于前端显示）
+    pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
     /// API 调用成功次数
@@ -56,6 +60,8 @@ pub struct CredentialStatusItem {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
+    pub endpoint: String,
 }
 
 // ============ 操作请求 ============
@@ -127,6 +133,10 @@ pub struct AddCredentialRequest {
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kiro_api_key: Option<String>,
+
+    /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 fn default_auth_method() -> String {
@@ -166,60 +176,6 @@ pub struct BalanceResponse {
     pub usage_percentage: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
-}
-
-// ============ 请求明细 ============
-
-/// 请求明细查询参数
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestDetailsQuery {
-    /// 返回条数（默认 100，最大 1000）
-    pub limit: Option<usize>,
-}
-
-/// 请求明细响应
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestDetailsResponse {
-    /// 解析成功的总记录数
-    pub total: usize,
-    /// 明细列表（按时间倒序）
-    pub records: Vec<RequestDetailItem>,
-}
-
-/// 单次请求明细
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestDetailItem {
-    /// 记录时间（RFC3339）
-    pub recorded_at: String,
-    /// 请求 ID
-    pub request_id: String,
-    /// 接口路径
-    pub endpoint: String,
-    /// 模型名
-    pub model: String,
-    /// 凭据 ID（可能为 0，新版已移除该字段）
-    pub credential_id: u64,
-    /// 是否流式
-    pub stream: bool,
-    /// 是否命中缓存
-    pub cache_hit: bool,
-    /// 输入 tokens（不包含缓存读取和缓存创建）
-    pub input_tokens: i32,
-    /// 缓存读取 tokens
-    pub cached_tokens: i32,
-    /// 输出 tokens
-    pub output_tokens: i32,
-    /// 缓存命中比例（cached / total_input）
-    pub cache_ratio: f64,
-    /// 按模型价格估算的费用（USD）
-    pub cost_usd: f64,
-    /// 上游返回的 credits（用于对照）
-    pub credits_used: f64,
-    /// 特殊设置命中记录（用于审计）
-    pub special_settings: Vec<String>,
 }
 
 // ============ 负载均衡配置 ============
