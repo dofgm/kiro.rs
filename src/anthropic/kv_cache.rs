@@ -87,6 +87,20 @@ struct KvInMemoryState {
 
 static KV_STATE: OnceLock<Mutex<KvInMemoryState>> = OnceLock::new();
 static KV_RECORDS_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static KV_CONFIG: OnceLock<(f64, i64)> = OnceLock::new();
+
+/// 设置 KV cache 的运行时配置（应在启动时调用一次）
+pub fn set_kv_cache_config(cache_read_efficiency: f64, kv_cache_ttl_secs: i64) {
+    let _ = KV_CONFIG.set((cache_read_efficiency.clamp(0.0, 1.0), kv_cache_ttl_secs.max(60)));
+}
+
+fn get_cache_read_efficiency() -> f64 {
+    KV_CONFIG.get().map(|(e, _)| *e).unwrap_or(0.87)
+}
+
+fn get_kv_cache_ttl_secs() -> i64 {
+    KV_CONFIG.get().map(|(_, t)| *t).unwrap_or(3600)
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -195,7 +209,7 @@ fn sum_prefix_tokens(tokens: &[i32], prefix_len: usize) -> i32 {
     total
 }
 
-fn maybe_prune_state(state: &mut KvInMemoryState, now_ts: i64) {
+fn maybe_prune_state(state: &mut KvInMemoryState, now_ts: i64, ttl_secs: i64) {
     if now_ts <= 0 {
         return;
     }
@@ -204,7 +218,7 @@ fn maybe_prune_state(state: &mut KvInMemoryState, now_ts: i64) {
     }
     state.last_pruned_at = now_ts;
 
-    let deadline = now_ts.saturating_sub(KV_STATE_TTL_SECS);
+    let deadline = now_ts.saturating_sub(ttl_secs);
     state.namespaces.retain(|_, entries| {
         entries.retain(|e| e.last_seen_at >= deadline);
         !entries.is_empty()
@@ -223,6 +237,8 @@ fn record_impl(
     let now_dt = Utc::now();
     let now = now_dt.to_rfc3339();
     let now_ts = now_dt.timestamp();
+    let cache_read_efficiency = get_cache_read_efficiency();
+    let kv_cache_ttl_secs = get_kv_cache_ttl_secs();
     let input_tokens = input.input_tokens.max(0);
     let prompt_hashes = input.prompt_hashes;
     let block_tokens = input
@@ -268,7 +284,7 @@ fn record_impl(
             state.namespaces.clear();
             state.last_pruned_at = 0;
         }
-        maybe_prune_state(&mut state, now_ts);
+        maybe_prune_state(&mut state, now_ts, kv_cache_ttl_secs);
 
         let entries = state.namespaces.entry(ns_key).or_default();
 
@@ -300,7 +316,9 @@ fn record_impl(
         }
 
         if let Some(idx) = best_idx {
-            cache_read_input_tokens = best_read_tokens.min(cacheable_input_tokens);
+            // 应用缓存效率折扣：模拟真实 KV cache 并非 100% 可复用
+            let raw_read = best_read_tokens.min(cacheable_input_tokens);
+            cache_read_input_tokens = (raw_read as f64 * cache_read_efficiency).round() as i32;
             entries[idx].hit_count = entries[idx].hit_count.saturating_add(1);
             entries[idx].last_seen_at = now_ts;
         }

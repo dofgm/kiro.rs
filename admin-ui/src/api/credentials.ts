@@ -106,6 +106,24 @@ export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promi
   return data
 }
 
+// KV 缓存配置
+export interface KvCacheConfig {
+  cacheReadEfficiency: number
+  kvCacheTtlSecs: number
+}
+
+// 获取 KV 缓存配置
+export async function getKvCacheConfig(): Promise<KvCacheConfig> {
+  const { data } = await api.get<KvCacheConfig>('/config/kv-cache')
+  return data
+}
+
+// 设置 KV 缓存配置
+export async function setKvCacheConfig(config: Partial<KvCacheConfig>): Promise<KvCacheConfig> {
+  const { data } = await api.put<KvCacheConfig>('/config/kv-cache', config)
+  return data
+}
+
 // 获取请求明细
 export async function getRequestDetails(limit?: number): Promise<RequestDetailsResponse> {
   const params = limit ? { limit } : {}

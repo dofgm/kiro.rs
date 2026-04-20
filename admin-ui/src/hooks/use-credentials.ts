@@ -12,6 +12,9 @@ import {
   setLoadBalancingMode,
   getRequestDetails,
   clearRequestDetails,
+  getKvCacheConfig,
+  setKvCacheConfig,
+  type KvCacheConfig,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -127,6 +130,25 @@ export function useRequestDetails(limit?: number) {
     queryKey: ['requestDetails', limit],
     queryFn: () => getRequestDetails(limit),
     refetchInterval: 30000,
+  })
+}
+
+// 获取 KV 缓存配置
+export function useKvCacheConfig() {
+  return useQuery({
+    queryKey: ['kvCacheConfig'],
+    queryFn: getKvCacheConfig,
+  })
+}
+
+// 设置 KV 缓存配置
+export function useSetKvCacheConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (config: Partial<KvCacheConfig>) => setKvCacheConfig(config),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['kvCacheConfig'] })
+    },
   })
 }
 

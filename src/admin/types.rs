@@ -234,6 +234,26 @@ pub struct RequestDetailItem {
 
 // ============ 负载均衡配置 ============
 
+/// KV 缓存配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KvCacheConfigResponse {
+    /// 缓存读取效率折扣（0.0~1.0）
+    pub cache_read_efficiency: f64,
+    /// 缓存状态 TTL（秒）
+    pub kv_cache_ttl_secs: i64,
+}
+
+/// 设置 KV 缓存配置请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetKvCacheConfigRequest {
+    /// 缓存读取效率折扣（0.0~1.0）
+    pub cache_read_efficiency: Option<f64>,
+    /// 缓存状态 TTL（秒）
+    pub kv_cache_ttl_secs: Option<i64>,
+}
+
 /// 负载均衡模式响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

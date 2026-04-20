@@ -10,7 +10,8 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, RequestDetailsQuery, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
+        SetKvCacheConfigRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
+        SuccessResponse,
     },
 };
 
@@ -157,6 +158,25 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/kv-cache
+/// 获取 KV 缓存配置
+pub async fn get_kv_cache_config(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_kv_cache_config();
+    Json(response)
+}
+
+/// PUT /api/admin/config/kv-cache
+/// 设置 KV 缓存配置
+pub async fn set_kv_cache_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetKvCacheConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_kv_cache_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

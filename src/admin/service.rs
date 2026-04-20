@@ -16,8 +16,9 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, RequestDetailItem,
-    RequestDetailsResponse, SetLoadBalancingModeRequest,
+    CredentialsStatusResponse, KvCacheConfigResponse, LoadBalancingModeResponse,
+    RequestDetailItem, RequestDetailsResponse, SetKvCacheConfigRequest,
+    SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -341,6 +342,56 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 获取 KV 缓存配置
+    pub fn get_kv_cache_config(&self) -> KvCacheConfigResponse {
+        let config = self.token_manager.config();
+        KvCacheConfigResponse {
+            cache_read_efficiency: config.cache_read_efficiency,
+            kv_cache_ttl_secs: config.kv_cache_ttl_secs,
+        }
+    }
+
+    /// 设置 KV 缓存配置
+    pub fn set_kv_cache_config(
+        &self,
+        req: SetKvCacheConfigRequest,
+    ) -> Result<KvCacheConfigResponse, AdminServiceError> {
+        use crate::anthropic::kv_cache::set_kv_cache_config;
+        use crate::model::config::Config;
+
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| {
+                AdminServiceError::InternalError("配置文件路径未知".to_string())
+            })?;
+
+        let mut config = Config::load(&config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        if let Some(efficiency) = req.cache_read_efficiency {
+            let clamped = efficiency.clamp(0.0, 1.0);
+            config.cache_read_efficiency = clamped;
+        }
+        if let Some(ttl) = req.kv_cache_ttl_secs {
+            config.kv_cache_ttl_secs = ttl.max(60);
+        }
+
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        // 更新运行时全局配置
+        set_kv_cache_config(config.cache_read_efficiency, config.kv_cache_ttl_secs);
+
+        Ok(KvCacheConfigResponse {
+            cache_read_efficiency: config.cache_read_efficiency,
+            kv_cache_ttl_secs: config.kv_cache_ttl_secs,
+        })
     }
 
     /// 强制刷新指定凭据的 Token

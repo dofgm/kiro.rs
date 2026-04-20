@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LayoutList, Database } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LayoutList, Database, Settings } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -13,7 +13,7 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { RequestDetailsPanel } from '@/components/request-details-panel'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useKvCacheConfig, useSetKvCacheConfig } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
@@ -23,7 +23,7 @@ interface DashboardProps {
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
-  const [activeTab, setActiveTab] = useState<'credentials' | 'details'>('credentials')
+  const [activeTab, setActiveTab] = useState<'credentials' | 'details' | 'settings'>('credentials')
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
@@ -56,6 +56,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const { data: kvCacheConfig } = useKvCacheConfig()
+  const { mutate: setKvCacheConfig } = useSetKvCacheConfig()
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
@@ -595,6 +597,17 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <Database className="h-4 w-4" />
             请求记录
           </button>
+          <button
+            className={`flex items-center gap-1.5 px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+              activeTab === 'settings'
+                ? 'border-primary text-primary'
+                : 'border-transparent text-muted-foreground hover:text-foreground'
+            }`}
+            onClick={() => setActiveTab('settings')}
+          >
+            <Settings className="h-4 w-4" />
+            设置
+          </button>
         </div>
 
         {activeTab === 'credentials' ? (
@@ -776,8 +789,66 @@ export function Dashboard({ onLogout }: DashboardProps) {
           )}
         </div>
           </>
-        ) : (
+        ) : activeTab === 'details' ? (
           <RequestDetailsPanel />
+        ) : (
+          <div className="space-y-6">
+            <h2 className="text-lg font-semibold">KV Cache 配置</h2>
+            <div className="grid gap-6 md:grid-cols-2">
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm font-medium">缓存效率系数</CardTitle>
+                  <p className="text-xs text-muted-foreground">
+                    控制模拟缓存命中率。0.87 表示将 ~98% 的前缀匹配折算为 ~85% 的实际缓存率
+                  </p>
+                </CardHeader>
+                <CardContent>
+                  <div className="flex items-center gap-4">
+                    <input
+                      type="range"
+                      min="50"
+                      max="100"
+                      value={Math.round((kvCacheConfig?.cacheReadEfficiency ?? 0.87) * 100)}
+                      onChange={(e) => {
+                        const val = parseInt(e.target.value) / 100
+                        setKvCacheConfig({ cacheReadEfficiency: val })
+                      }}
+                      className="flex-1"
+                    />
+                    <span className="text-2xl font-bold w-20 text-right">
+                      {Math.round((kvCacheConfig?.cacheReadEfficiency ?? 0.87) * 100)}%
+                    </span>
+                  </div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm font-medium">缓存 TTL</CardTitle>
+                  <p className="text-xs text-muted-foreground">
+                    历史 prompt 在内存中的存活时间，超时后不再参与前缀匹配
+                  </p>
+                </CardHeader>
+                <CardContent>
+                  <div className="flex items-center gap-4">
+                    <input
+                      type="number"
+                      min="60"
+                      max="86400"
+                      value={kvCacheConfig?.kvCacheTtlSecs ?? 3600}
+                      onChange={(e) => {
+                        const val = parseInt(e.target.value) || 3600
+                        setKvCacheConfig({ kvCacheTtlSecs: Math.max(60, val) })
+                      }}
+                      className="flex-1 h-10 rounded-md border border-input bg-background px-3 text-sm"
+                    />
+                    <span className="text-sm text-muted-foreground whitespace-nowrap">
+                      = {Math.round((kvCacheConfig?.kvCacheTtlSecs ?? 3600) / 60)} 分钟
+                    </span>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          </div>
         )}
       </main>
 
