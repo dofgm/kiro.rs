@@ -426,6 +426,24 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 64000,
         },
         Model {
+            id: "claude-opus-4-7".to_string(),
+            object: "model".to_string(),
+            created: 1775000000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-7-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1775000000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
             id: "claude-haiku-4-5-20251001".to_string(),
             object: "model".to_string(),
             created: 1727740800,
@@ -1223,7 +1241,7 @@ async fn handle_non_stream_request(
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
+/// - Opus 4.6/4.7：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
@@ -1232,10 +1250,11 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 = model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_4_6_or_newer = model_lower.contains("opus")
+        && (model_lower.contains("4-6") || model_lower.contains("4.6")
+            || model_lower.contains("4-7") || model_lower.contains("4.7"));
 
-    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
+    let thinking_type = if is_opus_4_6_or_newer { "adaptive" } else { "enabled" };
 
     tracing::info!(
         model = %payload.model,
@@ -1248,7 +1267,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         budget_tokens: 20000,
     });
 
-    if is_opus_4_6 {
+    if is_opus_4_6_or_newer {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
