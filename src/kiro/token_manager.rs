@@ -13,7 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -526,6 +526,8 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// Round-Robin 计数器（balanced 模式使用）
+    round_robin_counter: AtomicU64,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -655,6 +657,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            round_robin_counter: AtomicU64::new(0),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -726,11 +729,10 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
-                let entry = available
-                    .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                // Round-Robin 策略：轮询选择可用凭据，确保均匀分配
+                let counter = self.round_robin_counter.fetch_add(1, Ordering::Relaxed);
+                let index = (counter as usize) % available.len();
+                let entry = available[index];
 
                 Some((entry.id, entry.credentials.clone()))
             }
