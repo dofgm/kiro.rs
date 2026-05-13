@@ -4,6 +4,66 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// ============================================================================
+// 上游保护配置
+// ============================================================================
+
+fn default_upstream_protection_enabled() -> bool {
+    true
+}
+
+fn default_max_per_credential_model_concurrency() -> usize {
+    5
+}
+
+fn default_rate_limit_cooldown_ms() -> u64 {
+    2000
+}
+
+fn default_max_rate_limit_cooldown_ms() -> u64 {
+    60000
+}
+
+/// 账号-模型级上游保护配置
+///
+/// 限制每个凭据在同一模型上的并发请求数，并在收到 429 后进行指数退避冷却。
+/// 防止单个账号被上游限流导致雪崩。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpstreamProtectionConfig {
+    /// 是否启用账号-模型级上游保护
+    #[serde(default = "default_upstream_protection_enabled")]
+    pub enabled: bool,
+    /// 每个凭据在同一模型上的默认最大并发
+    #[serde(default = "default_max_per_credential_model_concurrency")]
+    pub max_per_credential_model_concurrency: usize,
+    /// 指定模型的每凭据并发覆盖值
+    #[serde(default)]
+    pub per_model_concurrency: HashMap<String, usize>,
+    /// 指定 profileArn 在指定模型上的总并发覆盖值
+    #[serde(default)]
+    pub per_profile_model_concurrency: HashMap<String, HashMap<String, usize>>,
+    /// 上游返回 429 后，该凭据-模型的基础冷却时间（毫秒）
+    #[serde(default = "default_rate_limit_cooldown_ms")]
+    pub rate_limit_cooldown_ms: u64,
+    /// 连续 429 时冷却时间上限（毫秒）
+    #[serde(default = "default_max_rate_limit_cooldown_ms")]
+    pub max_rate_limit_cooldown_ms: u64,
+}
+
+impl Default for UpstreamProtectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_upstream_protection_enabled(),
+            max_per_credential_model_concurrency: default_max_per_credential_model_concurrency(),
+            per_model_concurrency: HashMap::new(),
+            per_profile_model_concurrency: HashMap::new(),
+            rate_limit_cooldown_ms: default_rate_limit_cooldown_ms(),
+            max_rate_limit_cooldown_ms: default_max_rate_limit_cooldown_ms(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
@@ -124,6 +184,10 @@ pub struct Config {
     #[serde(default = "default_kv_cache_ttl_secs")]
     pub kv_cache_ttl_secs: i64,
 
+    /// 账号-模型级上游保护配置
+    #[serde(default)]
+    pub upstream_protection: UpstreamProtectionConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -209,6 +273,7 @@ impl Default for Config {
             endpoints: HashMap::new(),
             cache_read_efficiency: default_cache_read_efficiency(),
             kv_cache_ttl_secs: default_kv_cache_ttl_secs(),
+            upstream_protection: UpstreamProtectionConfig::default(),
             config_path: None,
         }
     }
