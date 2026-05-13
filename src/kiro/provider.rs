@@ -15,9 +15,18 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{MultiTokenManager, UpstreamBusyError, UpstreamRequestGuard};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
+
+/// API 调用响应（包含上游保护 guard，流式请求需持有到流结束）
+pub struct ApiCallResponse {
+    pub response: reqwest::Response,
+    /// 上游保护 guard，Drop 时释放 in-flight 槽位。
+    /// 流式请求必须持有此 guard 直到流完全消费完毕。
+    #[allow(dead_code)]
+    pub upstream_guard: Option<UpstreamRequestGuard>,
+}
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -111,12 +120,12 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<ApiCallResponse> {
         self.call_api_with_retry(request_body, false).await
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<ApiCallResponse> {
         self.call_api_with_retry(request_body, true).await
     }
 
@@ -134,7 +143,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let ctx = match self.token_manager.acquire_context(None, None, None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -276,27 +285,50 @@ impl KiroProvider {
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
     /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
     /// - 硬上限 9 次，避免无限重试
+    /// - 429 时记录上游限流并排除该凭据，切换到其他凭据继续
+    /// - 支持会话粘性路由（route_key）和上游保护（in-flight 限制）
     async fn call_api_with_retry(
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<ApiCallResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let max_selection_attempts = total_credentials.saturating_add(max_retries).max(1);
         let mut last_error: Option<anyhow::Error> = None;
+        let mut last_upstream_busy: Option<UpstreamBusyError> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut excluded_ids: HashSet<u64> = HashSet::new();
+        let mut sent_attempts = 0usize;
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        // 提取会话路由键（用于粘性路由）
+        let route_key = Self::extract_route_key_from_request(request_body);
 
-        for attempt in 0..max_retries {
+        for _selection_attempt in 0..max_selection_attempts {
+            if sent_attempts >= max_retries {
+                break;
+            }
+
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context(model.as_deref(), route_key.as_deref(), Some(&excluded_ids))
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
+                    if let Some(err) = last_upstream_busy.take() {
+                        return Err(UpstreamBusyError::exhausted(
+                            err.model,
+                            err.retry_after_ms.max(1000),
+                        )
+                        .into());
+                    }
                     last_error = Some(e);
-                    continue;
+                    break;
                 }
             };
 
@@ -308,6 +340,31 @@ impl KiroProvider {
                 Err(e) => {
                     last_error = Some(e);
                     self.token_manager.report_failure(ctx.id);
+                    continue;
+                }
+            };
+
+            // 尝试获取上游保护槽位
+            let upstream_guard = match self.token_manager.try_acquire_upstream_model_slot(
+                ctx.id,
+                ctx.credentials.profile_arn.as_deref(),
+                model.as_deref(),
+            ) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        model = %err.model,
+                        retry_after_ms = err.retry_after_ms,
+                        reason = %err.reason,
+                        "账号-模型上游保护拒绝本次上游调用，切换凭据"
+                    );
+                    last_upstream_busy = Some(err);
+                    excluded_ids.insert(ctx.id);
+                    if let Some(route_key) = route_key.as_deref() {
+                        self.token_manager
+                            .clear_route_affinity_if_matches(route_key, ctx.id);
+                    }
                     continue;
                 }
             };
@@ -330,6 +387,9 @@ impl KiroProvider {
                 .header("Connection", "close");
             let request = endpoint.decorate_api(base, &rctx);
 
+            let attempt = sent_attempts;
+            sent_attempts += 1;
+
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -339,10 +399,8 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
+                    if sent_attempts < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
                     continue;
@@ -353,8 +411,14 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
+                if let Some(route_key) = route_key.as_deref() {
+                    self.token_manager.bind_route_affinity(route_key, ctx.id);
+                }
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                return Ok(ApiCallResponse {
+                    response,
+                    upstream_guard,
+                });
             }
 
             // 失败响应：读取 body 用于日志/错误信息
@@ -371,6 +435,11 @@ impl KiroProvider {
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                excluded_ids.insert(ctx.id);
+                if let Some(route_key) = route_key.as_deref() {
+                    self.token_manager
+                        .clear_route_affinity_if_matches(route_key, ctx.id);
+                }
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -408,7 +477,12 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -416,6 +490,11 @@ impl KiroProvider {
                 }
 
                 let has_available = self.token_manager.report_failure(ctx.id);
+                excluded_ids.insert(ctx.id);
+                if let Some(route_key) = route_key.as_deref() {
+                    self.token_manager
+                        .clear_route_affinity_if_matches(route_key, ctx.id);
+                }
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -434,9 +513,44 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            // 429 - 立即让该账号-模型进入本地冷却，并切换其他凭据
+            if status.as_u16() == 429 {
+                let cooldown_ms = self
+                    .token_manager
+                    .record_upstream_rate_limited(
+                        ctx.id,
+                        ctx.credentials.profile_arn.as_deref(),
+                        model.as_deref(),
+                    )
+                    .unwrap_or(1000);
+                tracing::warn!(
+                    "API 请求失败（上游 429，账号-模型进入冷却 {}ms 并切换凭据，尝试 {}/{}）: {} {}",
+                    cooldown_ms,
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                excluded_ids.insert(ctx.id);
+                if let Some(route_key) = route_key.as_deref() {
+                    self.token_manager
+                        .clear_route_affinity_if_matches(route_key, ctx.id);
+                }
+                last_upstream_busy = Some(UpstreamBusyError::exhausted(
+                    model.as_deref().unwrap_or("unknown"),
+                    cooldown_ms.max(1000),
+                ));
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                continue;
+            }
+
+            // 408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
+            if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -450,7 +564,7 @@ impl KiroProvider {
                     status,
                     body
                 ));
-                if attempt + 1 < max_retries {
+                if sent_attempts < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
                 continue;
@@ -475,12 +589,18 @@ impl KiroProvider {
                 status,
                 body
             ));
-            if attempt + 1 < max_retries {
+            if sent_attempts < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
         }
 
         // 所有重试都失败
+        if let Some(err) = last_upstream_busy {
+            return Err(
+                UpstreamBusyError::exhausted(err.model, err.retry_after_ms.max(1000)).into(),
+            );
+        }
+
         Err(last_error.unwrap_or_else(|| {
             anyhow::anyhow!(
                 "{} API 请求失败：已达到最大重试次数（{}次）",
@@ -504,6 +624,26 @@ impl KiroProvider {
             .get("modelId")?
             .as_str()
             .map(|s| s.to_string())
+    }
+
+    /// 从请求体中提取路由键（conversationId）
+    ///
+    /// 用于会话粘性路由，同一会话的请求尽量路由到同一凭据
+    fn extract_route_key_from_request(request_body: &str) -> Option<String> {
+        use serde_json::Value;
+
+        let json: Value = serde_json::from_str(request_body).ok()?;
+        let conversation_id = json
+            .get("conversationState")?
+            .get("conversationId")?
+            .as_str()?
+            .trim();
+
+        if conversation_id.is_empty() {
+            return None;
+        }
+
+        Some(format!("conversation:{conversation_id}"))
     }
 
     fn retry_delay(attempt: usize) -> Duration {

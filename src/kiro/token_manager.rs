@@ -10,10 +10,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::Hash;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -23,7 +25,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::model::config::Config;
+use crate::model::config::{Config, UpstreamProtectionConfig};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -102,6 +104,227 @@ impl fmt::Display for RefreshTokenInvalidError {
 }
 
 impl std::error::Error for RefreshTokenInvalidError {}
+
+// ============================================================================
+// 上游保护 (Upstream Protection) 类型
+// ============================================================================
+
+/// 路由亲和 TTL（1 小时）
+const ROUTE_AFFINITY_TTL: StdDuration = StdDuration::from_secs(3600);
+/// 路由亲和最大条目数
+const ROUTE_AFFINITY_MAX_ENTRIES: usize = 20_000;
+
+/// 账号-模型级上游运行时状态
+#[derive(Debug, Clone, Default)]
+struct UpstreamModelRuntimeState {
+    /// 当前正在进行的请求数
+    in_flight: usize,
+    /// 冷却截止时间（429 后进入冷却）
+    cooldown_until: Option<Instant>,
+    /// 上次冷却时长（毫秒）
+    last_cooldown_ms: u64,
+    /// 连续 429 计数（用于指数退避）
+    rate_limit_count: u32,
+}
+
+/// 上游繁忙错误（所有凭据在该模型上均处于保护限制内）
+#[derive(Debug, Clone)]
+pub struct UpstreamBusyError {
+    pub credential_id: Option<u64>,
+    pub profile_arn: Option<String>,
+    pub model: String,
+    pub reason: String,
+    pub retry_after_ms: u64,
+}
+
+impl UpstreamBusyError {
+    fn credential_busy(
+        credential_id: u64,
+        model: String,
+        reason: impl Into<String>,
+        retry_after_ms: u64,
+    ) -> Self {
+        Self {
+            credential_id: Some(credential_id),
+            profile_arn: None,
+            model,
+            reason: reason.into(),
+            retry_after_ms,
+        }
+    }
+
+    fn profile_busy(
+        profile_arn: String,
+        model: String,
+        reason: impl Into<String>,
+        retry_after_ms: u64,
+    ) -> Self {
+        Self {
+            credential_id: None,
+            profile_arn: Some(profile_arn),
+            model,
+            reason: reason.into(),
+            retry_after_ms,
+        }
+    }
+
+    pub fn exhausted(model: impl Into<String>, retry_after_ms: u64) -> Self {
+        Self {
+            credential_id: None,
+            profile_arn: None,
+            model: model.into(),
+            reason: "所有可用账号在该模型上均处于本地保护限制内".to_string(),
+            retry_after_ms,
+        }
+    }
+}
+
+impl fmt::Display for UpstreamBusyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(credential_id) = self.credential_id {
+            write!(
+                f,
+                "代理繁忙（凭据 #{} 模型 {} 上游保护触发：{}）",
+                credential_id, self.model, self.reason
+            )
+        } else if let Some(profile_arn) = self.profile_arn.as_deref() {
+            write!(
+                f,
+                "代理繁忙（profile {} 模型 {} 上游保护触发：{}）",
+                profile_arn, self.model, self.reason
+            )
+        } else {
+            write!(
+                f,
+                "代理繁忙（模型 {} 上游保护触发：{}）",
+                self.model, self.reason
+            )
+        }
+    }
+}
+
+impl std::error::Error for UpstreamBusyError {}
+
+/// 账号-模型上游请求 guard。Drop 时释放本地 in-flight 槽位。
+pub struct UpstreamRequestGuard {
+    credential_states: Arc<Mutex<HashMap<(u64, String), UpstreamModelRuntimeState>>>,
+    profile_states: Arc<Mutex<HashMap<(String, String), UpstreamModelRuntimeState>>>,
+    credential_id: u64,
+    profile_arn: Option<String>,
+    model: String,
+}
+
+impl Drop for UpstreamRequestGuard {
+    fn drop(&mut self) {
+        release_upstream_runtime_state(
+            &self.profile_states,
+            self.profile_arn
+                .as_ref()
+                .map(|profile_arn| (profile_arn.clone(), self.model.clone())),
+        );
+        release_upstream_runtime_state(
+            &self.credential_states,
+            Some((self.credential_id, self.model.clone())),
+        );
+    }
+}
+
+/// 路由亲和条目（用于会话到凭据的短期粘性路由）
+#[derive(Clone, Debug)]
+struct RouteAffinityEntry {
+    credential_id: u64,
+    last_seen_at: Instant,
+}
+
+/// 释放上游运行时状态中的 in-flight 槽位
+fn release_upstream_runtime_state<K>(
+    states: &Arc<Mutex<HashMap<K, UpstreamModelRuntimeState>>>,
+    key: Option<K>,
+) where
+    K: Eq + Hash,
+{
+    let Some(key) = key else {
+        return;
+    };
+    let now = Instant::now();
+    let mut states = states.lock();
+
+    if let Some(state) = states.get_mut(&key) {
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if let Some(until) = state.cooldown_until {
+            if until <= now {
+                state.cooldown_until = None;
+                state.rate_limit_count = 0;
+                state.last_cooldown_ms = 0;
+            }
+        }
+        if state.in_flight == 0 && state.cooldown_until.is_none() && state.rate_limit_count == 0 {
+            states.remove(&key);
+        }
+    }
+}
+
+/// 对上游运行时状态应用 429 冷却（指数退避）
+fn apply_upstream_rate_limit_cooldown(
+    state: &mut UpstreamModelRuntimeState,
+    now: Instant,
+    config: &UpstreamProtectionConfig,
+) -> u64 {
+    if state
+        .cooldown_until
+        .map(|until| until <= now)
+        .unwrap_or(false)
+    {
+        state.cooldown_until = None;
+        state.rate_limit_count = 0;
+        state.last_cooldown_ms = 0;
+    }
+
+    state.rate_limit_count = state.rate_limit_count.saturating_add(1).min(16);
+    let multiplier = 2u64.saturating_pow(state.rate_limit_count.saturating_sub(1).min(16));
+    let cooldown_ms = config
+        .rate_limit_cooldown_ms
+        .saturating_mul(multiplier)
+        .min(config.max_rate_limit_cooldown_ms)
+        .max(1);
+    state.cooldown_until = Some(now + StdDuration::from_millis(cooldown_ms));
+    state.last_cooldown_ms = cooldown_ms;
+    cooldown_ms
+}
+
+/// 将模型名称归一化为保护键（去除 -thinking 后缀，统一版本号格式）
+fn normalize_protection_model_key(model: &str) -> String {
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.strip_suffix("-thinking").unwrap_or(&model);
+
+    if model.contains("opus") {
+        if model.contains("4-7") || model.contains("4.7") {
+            "claude-opus-4-7".to_string()
+        } else if model.contains("4-6") || model.contains("4.6") {
+            "claude-opus-4-6".to_string()
+        } else if model.contains("4-5") || model.contains("4.5") {
+            "claude-opus-4-5-20251101".to_string()
+        } else {
+            model.to_string()
+        }
+    } else if model.contains("sonnet") {
+        if model.contains("4-6") || model.contains("4.6") {
+            "claude-sonnet-4-6".to_string()
+        } else if model.contains("4-5") || model.contains("4.5") {
+            "claude-sonnet-4-5-20250929".to_string()
+        } else {
+            model.to_string()
+        }
+    } else if model.contains("haiku") {
+        if model.contains("4-5") || model.contains("4.5") {
+            "claude-haiku-4-5-20251001".to_string()
+        } else {
+            model.to_string()
+        }
+    } else {
+        model.to_string()
+    }
+}
 
 /// 刷新 Token
 pub(crate) async fn refresh_token(
@@ -522,12 +745,18 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 账号-模型级上游保护配置（运行时可修改）
+    upstream_protection: Mutex<UpstreamProtectionConfig>,
+    /// 账号-模型级上游保护运行态
+    upstream_model_state: Arc<Mutex<HashMap<(u64, String), UpstreamModelRuntimeState>>>,
+    /// profile-模型级上游保护运行态
+    profile_model_state: Arc<Mutex<HashMap<(String, String), UpstreamModelRuntimeState>>>,
+    /// 路由亲和缓存（route_key -> 最近使用的凭据）
+    route_affinity: Mutex<HashMap<String, RouteAffinityEntry>>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
-    /// Round-Robin 计数器（balanced 模式使用）
-    round_robin_counter: AtomicU64,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -646,6 +875,7 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let upstream_protection = config.upstream_protection.clone();
         let manager = Self {
             config,
             proxy,
@@ -655,9 +885,12 @@ impl MultiTokenManager {
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            upstream_protection: Mutex::new(upstream_protection),
+            upstream_model_state: Arc::new(Mutex::new(HashMap::new())),
+            profile_model_state: Arc::new(Mutex::new(HashMap::new())),
+            route_affinity: Mutex::new(HashMap::new()),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
-            round_robin_counter: AtomicU64::new(0),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -697,7 +930,11 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+        excluded_ids: Option<&HashSet<u64>>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
 
         // 检查是否是 opus 模型
@@ -705,18 +942,29 @@ impl MultiTokenManager {
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
 
-        // 过滤可用凭据
+        let is_excluded = |id: u64| excluded_ids.map(|ids| ids.contains(&id)).unwrap_or(false);
+
+        // 过滤可用凭据，并提前跳过该模型本地上游保护已冷却/满槽的账号
         let available: Vec<_> = entries
             .iter()
-            .filter(|e| {
+            .filter_map(|e| {
                 if e.disabled {
-                    return false;
+                    return None;
+                }
+                if is_excluded(e.id) {
+                    return None;
                 }
                 // 如果是 opus 模型，需要检查订阅等级
                 if is_opus && !e.credentials.supports_opus() {
-                    return false;
+                    return None;
                 }
-                true
+                // 查询上游保护状态：None 表示冷却中或满槽，应跳过
+                let in_flight = self.upstream_model_selection_in_flight(
+                    e.id,
+                    e.credentials.profile_arn.as_deref(),
+                    model,
+                )?;
+                Some((e, in_flight))
             })
             .collect();
 
@@ -729,16 +977,19 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Round-Robin 策略：轮询选择可用凭据，确保均匀分配
-                let counter = self.round_robin_counter.fetch_add(1, Ordering::Relaxed);
-                let index = (counter as usize) % available.len();
-                let entry = available[index];
+                // Least-Used 策略：优先选择当前模型 in-flight 最少的凭据，
+                // 平局时按成功次数和优先级排序
+                let (entry, _) = available.iter().min_by_key(|(e, in_flight)| {
+                    (*in_flight, e.success_count, e.credentials.priority)
+                })?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
             _ => {
-                // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
+                // priority 模式（默认）：先避开繁忙账号，再选择优先级最高的
+                let (entry, _) = available
+                    .iter()
+                    .min_by_key(|(e, in_flight)| (*in_flight, e.credentials.priority))?;
                 Some((entry.id, entry.credentials.clone()))
             }
         }
@@ -753,8 +1004,15 @@ impl MultiTokenManager {
     /// Token 刷新失败会累计到当前凭据，达到阈值后禁用并切换
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据
+    /// - `route_key`: 可选的路由键，用于会话粘性路由
+    /// - `excluded_ids`: 可选的排除凭据 ID 集合（已失败的凭据）
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        route_key: Option<&str>,
+        excluded_ids: Option<&HashSet<u64>>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -771,58 +1029,75 @@ impl MultiTokenManager {
             let (id, credentials) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
-                    None
+                // 先尝试路由亲和：如果有 route_key 且对应凭据可用，优先使用
+                let affinity_hit = if let Some(route_key) = route_key {
+                    let hit = self.get_preferred_credential_for_route(route_key, model);
+                    // 确保亲和命中的凭据不在排除列表中
+                    hit.filter(|(id, _)| {
+                        !excluded_ids.map(|ids| ids.contains(id)).unwrap_or(false)
+                    })
                 } else {
-                    let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
-                        .map(|e| (e.id, e.credentials.clone()))
+                    None
                 };
 
-                if let Some(hit) = current_hit {
+                if let Some(hit) = affinity_hit {
                     hit
                 } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
-
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                    if best.is_none() {
-                        let mut entries = self.entries.lock();
-                        if entries.iter().any(|e| {
-                            e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
-                        }) {
-                            tracing::warn!(
-                                "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
-                            );
-                            for e in entries.iter_mut() {
-                                if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
-                                    e.disabled = false;
-                                    e.disabled_reason = None;
-                                    e.failure_count = 0;
-                                }
-                            }
-                            drop(entries);
-                            best = self.select_next_credential(model);
-                        }
-                    }
-
-                    if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
-                        (new_id, new_creds)
+                    // balanced 模式：每次请求都重新均衡选择，不固定 current_id
+                    // priority 模式：优先使用 current_id 指向的凭据
+                    let current_hit = if is_balanced {
+                        None
                     } else {
                         let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        let current_id = *self.current_id.lock();
+                        let hit = entries
+                            .iter()
+                            .find(|e| e.id == current_id && !e.disabled)
+                            .map(|e| (e.id, e.credentials.clone()));
+                        // 确保 current_id 不在排除列表中
+                        hit.filter(|(id, _)| {
+                            !excluded_ids.map(|ids| ids.contains(id)).unwrap_or(false)
+                        })
+                    };
+
+                    if let Some(hit) = current_hit {
+                        hit
+                    } else {
+                        // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
+                        let mut best = self.select_next_credential(model, excluded_ids);
+
+                        // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
+                        if best.is_none() {
+                            let mut entries = self.entries.lock();
+                            if entries.iter().any(|e| {
+                                e.disabled
+                                    && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                            }) {
+                                tracing::warn!(
+                                    "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
+                                );
+                                for e in entries.iter_mut() {
+                                    if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                                        e.disabled = false;
+                                        e.disabled_reason = None;
+                                        e.failure_count = 0;
+                                    }
+                                }
+                                drop(entries);
+                                best = self.select_next_credential(model, excluded_ids);
+                            }
+                        }
+
+                        if let Some((new_id, new_creds)) = best {
+                            // 更新 current_id
+                            let mut current_id = self.current_id.lock();
+                            *current_id = new_id;
+                            (new_id, new_creds)
+                        } else {
+                            let entries = self.entries.lock();
+                            let available = entries.iter().filter(|e| !e.disabled).count();
+                            anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        }
                     }
                 }
             };
@@ -1117,6 +1392,390 @@ impl MultiTokenManager {
 
         if should_flush {
             self.save_stats();
+        }
+    }
+
+    // ========================================================================
+    // 上游保护 (Upstream Protection) 方法
+    // ========================================================================
+
+    /// 获取当前上游保护配置
+    pub fn get_upstream_protection_config(&self) -> UpstreamProtectionConfig {
+        self.upstream_protection.lock().clone()
+    }
+
+    /// 获取指定模型的每凭据并发上限
+    pub fn upstream_model_limit(config: &UpstreamProtectionConfig, model: &str) -> usize {
+        let model = normalize_protection_model_key(model);
+        config
+            .per_model_concurrency
+            .get(&model)
+            .copied()
+            .unwrap_or(config.max_per_credential_model_concurrency)
+            .max(1)
+    }
+
+    /// 获取指定 profile 在指定模型上的并发上限（如果配置了）
+    pub fn upstream_profile_model_limit(
+        config: &UpstreamProtectionConfig,
+        profile_arn: Option<&str>,
+        model: &str,
+    ) -> Option<usize> {
+        let profile_arn = profile_arn?.trim();
+        if profile_arn.is_empty() {
+            return None;
+        }
+
+        let model = normalize_protection_model_key(model);
+        config
+            .per_profile_model_concurrency
+            .get(profile_arn)
+            .and_then(|model_limits| model_limits.get(&model))
+            .copied()
+            .map(|limit| limit.max(1))
+    }
+
+    /// 在凭据选择阶段查询指定凭据-模型的 in_flight 数。
+    /// 返回 None 表示该凭据在该模型上处于冷却或满槽，应跳过。
+    fn upstream_model_selection_in_flight(
+        &self,
+        credential_id: u64,
+        profile_arn: Option<&str>,
+        model: Option<&str>,
+    ) -> Option<usize> {
+        let Some(model) = model else {
+            return Some(0);
+        };
+        let config = self.get_upstream_protection_config();
+        if !config.enabled {
+            return Some(0);
+        }
+
+        let model = normalize_protection_model_key(model);
+        if model.is_empty() {
+            return Some(0);
+        }
+
+        let now = Instant::now();
+        let mut observed_in_flight = 0usize;
+        let profile_arn = profile_arn
+            .map(str::trim)
+            .filter(|profile_arn| !profile_arn.is_empty());
+
+        if let Some(profile_limit) =
+            Self::upstream_profile_model_limit(&config, profile_arn, &model)
+        {
+            if let Some(profile_arn) = profile_arn {
+                let profile_states = self.profile_model_state.lock();
+                if let Some(state) =
+                    profile_states.get(&(profile_arn.to_string(), model.clone()))
+                {
+                    if state.cooldown_until.is_some_and(|until| until > now) {
+                        return None;
+                    }
+                    if state.in_flight >= profile_limit {
+                        return None;
+                    }
+                    observed_in_flight = observed_in_flight.max(state.in_flight);
+                }
+            }
+        }
+
+        let limit = Self::upstream_model_limit(&config, &model);
+        let states = self.upstream_model_state.lock();
+        if let Some(state) = states.get(&(credential_id, model)) {
+            if state.cooldown_until.is_some_and(|until| until > now) {
+                return None;
+            }
+            if state.in_flight >= limit {
+                return None;
+            }
+            observed_in_flight = observed_in_flight.max(state.in_flight);
+        }
+
+        Some(observed_in_flight)
+    }
+
+    /// 尝试获取上游模型槽位。
+    /// 成功返回 Ok(Some(guard))，保护未启用返回 Ok(None)，繁忙返回 Err。
+    pub fn try_acquire_upstream_model_slot(
+        &self,
+        credential_id: u64,
+        profile_arn: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Option<UpstreamRequestGuard>, UpstreamBusyError> {
+        let Some(model) = model else {
+            return Ok(None);
+        };
+        let config = self.get_upstream_protection_config();
+        if !config.enabled {
+            return Ok(None);
+        }
+
+        let model = normalize_protection_model_key(model);
+        let profile_arn = profile_arn
+            .map(str::trim)
+            .filter(|profile_arn| !profile_arn.is_empty())
+            .map(str::to_string);
+        let profile_limit =
+            Self::upstream_profile_model_limit(&config, profile_arn.as_deref(), &model);
+        let mut acquired_profile_arn = None;
+        let limit = Self::upstream_model_limit(&config, &model);
+        let now = Instant::now();
+
+        // 先检查 profile 级别
+        if let (Some(profile_arn), Some(profile_limit)) =
+            (profile_arn.as_deref(), profile_limit)
+        {
+            let mut profile_states = self.profile_model_state.lock();
+            let state = profile_states
+                .entry((profile_arn.to_string(), model.clone()))
+                .or_default();
+
+            if let Some(until) = state.cooldown_until {
+                if until > now {
+                    let retry_after_ms = until.duration_since(now).as_millis() as u64;
+                    return Err(UpstreamBusyError::profile_busy(
+                        profile_arn.to_string(),
+                        model,
+                        format!("429 冷却中，剩余 {}ms", retry_after_ms),
+                        retry_after_ms,
+                    ));
+                }
+                state.cooldown_until = None;
+                state.rate_limit_count = 0;
+                state.last_cooldown_ms = 0;
+            }
+
+            if state.in_flight >= profile_limit {
+                return Err(UpstreamBusyError::profile_busy(
+                    profile_arn.to_string(),
+                    model,
+                    format!(
+                        "profile 本地并发槽位已满 {}/{}",
+                        state.in_flight, profile_limit
+                    ),
+                    1000,
+                ));
+            }
+
+            state.in_flight += 1;
+            acquired_profile_arn = Some(profile_arn.to_string());
+            tracing::debug!(
+                profile_arn = %profile_arn,
+                model = %model,
+                in_flight = state.in_flight,
+                limit = profile_limit,
+                "profile-模型上游保护准入"
+            );
+        }
+
+        // 再检查凭据级别
+        let mut states = self.upstream_model_state.lock();
+        let state = states.entry((credential_id, model.clone())).or_default();
+
+        if let Some(until) = state.cooldown_until {
+            if until > now {
+                let retry_after_ms = until.duration_since(now).as_millis() as u64;
+                drop(states);
+                release_upstream_runtime_state(
+                    &self.profile_model_state,
+                    acquired_profile_arn
+                        .as_ref()
+                        .map(|profile_arn| (profile_arn.clone(), model.clone())),
+                );
+                return Err(UpstreamBusyError::credential_busy(
+                    credential_id,
+                    model,
+                    format!("429 冷却中，剩余 {}ms", retry_after_ms),
+                    retry_after_ms,
+                ));
+            }
+            state.cooldown_until = None;
+            state.rate_limit_count = 0;
+            state.last_cooldown_ms = 0;
+        }
+
+        if state.in_flight >= limit {
+            let in_flight = state.in_flight;
+            drop(states);
+            release_upstream_runtime_state(
+                &self.profile_model_state,
+                acquired_profile_arn
+                    .as_ref()
+                    .map(|profile_arn| (profile_arn.clone(), model.clone())),
+            );
+            return Err(UpstreamBusyError::credential_busy(
+                credential_id,
+                model,
+                format!("本地并发槽位已满 {}/{}", in_flight, limit),
+                1000,
+            ));
+        }
+
+        state.in_flight += 1;
+        tracing::debug!(
+            credential_id,
+            model = %model,
+            in_flight = state.in_flight,
+            limit,
+            "账号-模型上游保护准入"
+        );
+
+        Ok(Some(UpstreamRequestGuard {
+            credential_states: self.upstream_model_state.clone(),
+            profile_states: self.profile_model_state.clone(),
+            credential_id,
+            profile_arn: acquired_profile_arn,
+            model,
+        }))
+    }
+
+    /// 记录上游返回 429，让该凭据-模型进入本地冷却。
+    /// 返回冷却时长（毫秒），None 表示保护未启用。
+    pub fn record_upstream_rate_limited(
+        &self,
+        credential_id: u64,
+        profile_arn: Option<&str>,
+        model: Option<&str>,
+    ) -> Option<u64> {
+        let model = model?;
+        let config = self.get_upstream_protection_config();
+        if !config.enabled {
+            return None;
+        }
+
+        let model = normalize_protection_model_key(model);
+        let now = Instant::now();
+        let mut max_cooldown_ms = 0;
+
+        let profile_arn = profile_arn
+            .map(str::trim)
+            .filter(|profile_arn| !profile_arn.is_empty());
+        if Self::upstream_profile_model_limit(&config, profile_arn, &model).is_some() {
+            if let Some(profile_arn) = profile_arn {
+                let mut profile_states = self.profile_model_state.lock();
+                let state = profile_states
+                    .entry((profile_arn.to_string(), model.clone()))
+                    .or_default();
+                let cooldown_ms = apply_upstream_rate_limit_cooldown(state, now, &config);
+                max_cooldown_ms = max_cooldown_ms.max(cooldown_ms);
+
+                tracing::warn!(
+                    profile_arn = %profile_arn,
+                    model = %model,
+                    cooldown_ms,
+                    rate_limit_count = state.rate_limit_count,
+                    "上游返回 429，profile-模型进入本地冷却"
+                );
+            }
+        }
+
+        let mut states = self.upstream_model_state.lock();
+        let state = states.entry((credential_id, model.clone())).or_default();
+
+        let cooldown_ms = apply_upstream_rate_limit_cooldown(state, now, &config);
+        max_cooldown_ms = max_cooldown_ms.max(cooldown_ms);
+
+        tracing::warn!(
+            credential_id,
+            model = %model,
+            cooldown_ms,
+            rate_limit_count = state.rate_limit_count,
+            "上游返回 429，账号-模型进入本地冷却"
+        );
+
+        Some(max_cooldown_ms)
+    }
+
+    // ========================================================================
+    // 路由亲和 (Route Affinity) 方法
+    // ========================================================================
+
+    /// 清理过期的路由亲和条目
+    fn prune_route_affinity_locked(route_affinity: &mut HashMap<String, RouteAffinityEntry>) {
+        route_affinity.retain(|_, entry| entry.last_seen_at.elapsed() < ROUTE_AFFINITY_TTL);
+    }
+
+    /// 获取路由键对应的首选凭据（如果存在且仍可用）
+    fn get_preferred_credential_for_route(
+        &self,
+        route_key: &str,
+        model: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
+        let mapped_id = {
+            let mut route_affinity = self.route_affinity.lock();
+            Self::prune_route_affinity_locked(&mut route_affinity);
+            route_affinity
+                .get(route_key)
+                .map(|entry| entry.credential_id)
+        }?;
+
+        // 检查该凭据是否仍然可用
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+
+        let preferred = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| {
+                    e.id == mapped_id
+                        && !e.disabled
+                        && (!is_opus || e.credentials.supports_opus())
+                })
+                .map(|e| (e.id, e.credentials.clone()))
+        };
+
+        if preferred.is_none() {
+            self.clear_route_affinity_if_matches(route_key, mapped_id);
+        }
+
+        preferred
+    }
+
+    /// 记录路由亲和（内部方法）
+    fn remember_route_affinity(&self, route_key: &str, credential_id: u64) {
+        let mut route_affinity = self.route_affinity.lock();
+        Self::prune_route_affinity_locked(&mut route_affinity);
+
+        if !route_affinity.contains_key(route_key)
+            && route_affinity.len() >= ROUTE_AFFINITY_MAX_ENTRIES
+        {
+            // 淘汰最久未使用的条目
+            if let Some(oldest_key) = route_affinity
+                .iter()
+                .max_by_key(|(_, entry)| entry.last_seen_at.elapsed())
+                .map(|(key, _)| key.clone())
+            {
+                route_affinity.remove(&oldest_key);
+            }
+        }
+
+        route_affinity.insert(
+            route_key.to_string(),
+            RouteAffinityEntry {
+                credential_id,
+                last_seen_at: Instant::now(),
+            },
+        );
+    }
+
+    /// 绑定路由亲和（公开方法，供 provider 调用）
+    pub fn bind_route_affinity(&self, route_key: &str, credential_id: u64) {
+        self.remember_route_affinity(route_key, credential_id);
+    }
+
+    /// 清除路由亲和（仅当当前绑定的凭据 ID 匹配时）
+    pub fn clear_route_affinity_if_matches(&self, route_key: &str, credential_id: u64) -> bool {
+        let mut route_affinity = self.route_affinity.lock();
+        match route_affinity.get(route_key) {
+            Some(entry) if entry.credential_id == credential_id => {
+                route_affinity.remove(route_key);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -2330,7 +2989,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -2352,7 +3011,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -2397,7 +3056,7 @@ mod tests {
         }
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, None, None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2437,7 +3096,7 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, None, None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",

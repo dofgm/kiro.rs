@@ -310,6 +310,19 @@ fn map_provider_error(
         &err_str,
     );
 
+    // 上游保护触发（所有凭据在该模型上均繁忙）→ 返回 429
+    if err.downcast_ref::<crate::kiro::token_manager::UpstreamBusyError>().is_some() {
+        tracing::warn!(error = %err, "上游保护触发：所有凭据繁忙");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                &err_str,
+            )),
+        )
+            .into_response();
+    }
+
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
@@ -648,7 +661,8 @@ async fn handle_stream_request(
             return map_provider_error(provider.as_ref(), endpoint, model, request_body, e);
         }
     };
-    let response = api_response;
+    let _upstream_guard = api_response.upstream_guard;
+    let response = api_response.response;
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, false, tool_name_map);
@@ -979,7 +993,8 @@ async fn handle_non_stream_request(
             return map_provider_error(provider.as_ref(), endpoint, model, request_body, e);
         }
     };
-    let response = api_response;
+    let _upstream_guard = api_response.upstream_guard;
+    let response = api_response.response;
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -1488,7 +1503,8 @@ async fn handle_stream_request_buffered(
             return map_provider_error(provider.as_ref(), endpoint, model, request_body, e);
         }
     };
-    let response = api_response;
+    let _upstream_guard = api_response.upstream_guard;
+    let response = api_response.response;
 
     // 创建缓冲流处理上下文
     let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
